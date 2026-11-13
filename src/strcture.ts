@@ -30,7 +30,7 @@ export const structureCatalogue: Record<string, StructureDef> = {
   prism3: {
     id: "prism3",
     name: "3-Strut Prism",
-    params: { radius: 2, height: 3, twist: Math.PI / 6, startY: 4 },
+    params: { radius: 0.2, height: 0.3, twist: Math.PI / 6, startY: 4 },
     generatePoints: ({ radius, height, twist, startY }) => {
       const bottomPos = [0, 1, 2].map((i) => {
         const angle = (i * 2 * Math.PI) / 3;
@@ -82,7 +82,7 @@ export const structureCatalogue: Record<string, StructureDef> = {
   tbar: {
     id: "tbar",
     name: "T-Bar",
-    params: { halfLength: 1.5, transverse: 1.0, startY: 4 },
+    params: { halfLength: 0.15, transverse: .10, startY: 0.4 },
     generatePoints: ({ halfLength: L, transverse: t, startY }) => [
       new BABYLON.Vector3(0, startY, 0), // 0  bottom end
       new BABYLON.Vector3(0, startY + L, 0), // 1  centre (kink node)
@@ -137,7 +137,7 @@ export const structureCatalogue: Record<string, StructureDef> = {
   dbar: {
     id: "dbar",
     name: "D-Bar",
-    params: { halfHeight: 1.5, width: 1.0, startY: 4 },
+    params: { halfHeight: 0.15, width: 0.10, startY: 0.4 },
     generatePoints: ({ halfHeight: h, width: w, startY }) => [
       new BABYLON.Vector3(0, startY, 0), // 0  bottom
       new BABYLON.Vector3(w, startY + h, 0), // 1  right
