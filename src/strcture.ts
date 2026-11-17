@@ -16,6 +16,8 @@ export interface StructureDef {
   strutIndexPairs: [number, number][];
   /** Tension members (cables/strings). */
   cableIndexPairs: [number, number][];
+  /** Nodes bolted to the ground / test rig: they never move. */
+  anchors: number[];
   /** true = self-equilibrates standalone; false = needs pinned nodes or an external load. */
   selfStressed: boolean;
   /** Nodes where external axial load is applied (only meaningful when selfStressed = false). */
@@ -30,7 +32,7 @@ export const structureCatalogue: Record<string, StructureDef> = {
   prism3: {
     id: "prism3",
     name: "3-Strut Prism",
-    params: { radius: 0.2, height: 0.3, twist: Math.PI / 6, startY: 4 },
+    params: { radius: 0.2, height: 0.3, twist: Math.PI / 6, startY: 0.1 },   // bottom on the floor
     generatePoints: ({ radius, height, twist, startY }) => {
       const bottomPos = [0, 1, 2].map((i) => {
         const angle = (i * 2 * Math.PI) / 3;
@@ -66,6 +68,7 @@ export const structureCatalogue: Record<string, StructureDef> = {
       [1, 4],
       [2, 5], // verticals
     ],
+    anchors: [],          // free: nothing bolted down, grab it like a real object
     selfStressed: true,
   },
 
@@ -114,6 +117,7 @@ export const structureCatalogue: Record<string, StructureDef> = {
       [6,4],
       [5,4]
     ],
+    anchors: [],          // free: nothing bolted down, grab it like a real object
     selfStressed: true,
   },
 
@@ -136,7 +140,7 @@ export const structureCatalogue: Record<string, StructureDef> = {
    * ------------------------------------------------------------------ */
   dbar: {
     id: "dbar",
-    name: "D-Bar",
+    name: "D-Bar (flat)",
     params: { halfHeight: 0.15, width: 0.10, startY: 0.4 },
     generatePoints: ({ halfHeight: h, width: w, startY }) => [
       new BABYLON.Vector3(0, startY, 0), // 0  bottom
@@ -154,6 +158,40 @@ export const structureCatalogue: Record<string, StructureDef> = {
       [1, 3], // short diagonal
       [0, 2], // long diagonal
     ],
+    anchors: [],          // free: nothing bolted down, grab it like a real object
+    selfStressed: true,
+  },
+
+  /* ------------------------------------------------------------------ *
+   * D-BAR 3D  —  6 nodes, 8 struts, 7 strings
+   * Two D-bars crossed at 90° sharing the long string (0-2), plus a ring
+   * of 4 strings around the waist (1-4-3-5). The flat D-bar has a NEGATIVE
+   * out-of-plane stiffness (it buckles sideways under its own prestress);
+   * the ring makes the 3D version stable in every direction.
+   * Checked: 3 self-stress states, 0 negative stiffness eigenvalues.
+   * ------------------------------------------------------------------ */
+  dbar3d: {
+    id: "dbar3d",
+    name: "D-Bar 3D",
+    params: { halfHeight: 0.15, width: 0.10, startY: 0.4 },
+    generatePoints: ({ halfHeight: h, width: w, startY }) => [
+      new BABYLON.Vector3(0, startY, 0),          // 0  bottom
+      new BABYLON.Vector3(w, startY + h, 0),      // 1  +X
+      new BABYLON.Vector3(0, startY + 2 * h, 0),  // 2  top
+      new BABYLON.Vector3(-w, startY + h, 0),     // 3  −X
+      new BABYLON.Vector3(0, startY + h, w),      // 4  +Z
+      new BABYLON.Vector3(0, startY + h, -w),     // 5  −Z
+    ],
+    strutIndexPairs: [
+      [0, 1], [1, 2], [2, 3], [3, 0],             // D-bar in the XY plane
+      [0, 4], [4, 2], [2, 5], [5, 0],             // D-bar in the ZY plane
+    ],
+    cableIndexPairs: [
+      [0, 2],                                     // shared long string
+      [1, 3], [4, 5],                             // short strings
+      [1, 4], [4, 3], [3, 5], [5, 1],             // waist ring
+    ],
+    anchors: [],          // free: nothing bolted down, grab it like a real object
     selfStressed: true,
   },
 };

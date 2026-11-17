@@ -22,3 +22,76 @@ html, body {
 .sub-panel label, .sub-panel input { display: block; width: 100%; margin-top: 8px; }
 .sub-panel button { margin: 10px 6px 0 0; background: #C9A227; border: none; padding: 4px 10px; cursor: pointer; }
 .sub-stats { font-family: "IBM Plex Mono", monospace; font-size: 12px; margin-top: 10px; }
+
+/* ============================================================
+   Left control panel — same look as the VR console
+   ============================================================ */
+.gui {
+  position: fixed; top: 12px; left: 12px; z-index: 10;
+  width: 270px;
+  max-height: calc(100vh - 24px);   /* never taller than the window ... */
+  overflow-y: auto;                 /* ... and scroll when the content is longer */
+  padding: 16px;
+  box-sizing: border-box;
+  background: rgba(20, 24, 35, 0.92);
+  border: 1px solid #2E3647;
+  border-radius: 18px;
+  color: #E8E6E0;
+  font-family: "Segoe UI", Helvetica, Arial, sans-serif;
+  font-size: 13px;
+  backdrop-filter: blur(6px);
+}
+/* slim scrollbar */
+.gui::-webkit-scrollbar { width: 8px; }
+.gui::-webkit-scrollbar-thumb { background: #3A4253; border-radius: 4px; }
+.gui::-webkit-scrollbar-track { background: transparent; }
+
+.gui-header { font-size: 20px; font-weight: 700; margin: 0 0 12px 2px; }
+
+.gui-card {
+  background: #1F2533;
+  border-radius: 12px;
+  padding: 10px 12px;
+  margin-bottom: 10px;
+}
+.gui-title {
+  color: #8A93A6; font-weight: 700; font-size: 12px;
+  text-transform: uppercase; letter-spacing: 0.06em;
+  margin-bottom: 8px;
+}
+.gui-list { display: flex; flex-direction: column; gap: 6px; }
+
+.gui-btn {
+  text-align: left; padding: 8px 10px; font-size: 13px; cursor: pointer;
+  border: 1px solid #2E3647; border-radius: 9px;
+  background: #262D3D; color: #E8E6E0;
+  transition: background 0.15s;
+}
+.gui-btn:hover { background: #2E3647; }
+.gui-btn.active { background: #3A6EA5; border-color: #3A6EA5; color: white; }
+.gui-btn.gold   { background: #C9A227; border-color: #C9A227; color: #111; }
+
+.gui-legend { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+.gui-dot { width: 12px; height: 12px; border-radius: 50%; display: inline-block; }
+
+.gui-readout { white-space: pre-line; line-height: 1.5; margin-top: 6px; }
+.gui-status { font-size: 11px; color: #8A93A6; margin-top: 6px; }
+.gui-mono { font-family: "IBM Plex Mono", Menlo, monospace; font-size: 12px; color: #C9A227; white-space: pre; }
+
+.gui select, .gui input {
+  background: #262D3D; color: #E8E6E0;
+  border: 1px solid #2E3647; border-radius: 8px;
+  padding: 6px 8px; font-size: 12px;
+}
+.gui select { width: 100%; margin-bottom: 8px; }
+.gui input  { width: 80px; }
+.gui label  { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-top: 4px; }
+
+/* heat map: 3 buttons side by side + a colour bar with labels */
+.gui-seg { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+.gui-seg .gui-btn { text-align: center; padding: 7px 4px; font-size: 12px; }
+.gui-heatbar {
+  height: 12px; border-radius: 6px; margin-top: 10px;
+  background: linear-gradient(to right, #2C7BB6, #00A6CA, #7FD18B, #F9D057, #D7191C);
+}
+.gui-heatlabels { display: flex; justify-content: space-between; font-size: 11px; color: #8A93A6; margin-top: 4px; }

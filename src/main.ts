@@ -2,12 +2,13 @@
 import * as BABYLON from "babylonjs";
 import "babylonjs-loaders";
 import "./style.css";
-import { MATERIALS, barMass, bucklingForce, SECTION_FIELDS, type Materials, type CrossSection, getMaterialById, sizeCable } from "./materials";
+import { MATERIALS, CrossSectionArea, barMass, bucklingForce, SECTION_FIELDS, type Materials, type CrossSection, getMaterialById, sizeCable } from "./materials";
 import { getStructure, listStructures, type StructureDef } from "./strcture";
 import { createMoonEnvironment, type MoonEnvironment } from "./moonEnvironment";
 import { createSubstitutionPanel } from "./substitutionPanel";
 import { substituteAll, type Topology } from "./substitution";
-import { FDMGrab, selfStress, type FDMember, type MemberPair, type Vec3 } from "./fdm"; // NEW (FDM)
+import { FDMGrab, type FDMember, type MemberPair, type Vec3 } from "./fdm"; // NEW (FDM)
+import { step as physicsStep, designPrestress, restLengthFor, memberForce, type PMember, type Hold } from "./physics";
 import { createVRPanel, type VRPanelAPI } from "./vrPanel"; 
 
 const canvas = document.getElementById("renderCanvas") as HTMLCanvasElement;
@@ -22,10 +23,9 @@ const PLANET: Planet =
   new URLSearchParams(window.location.search).get("planet") === "mars" ? "mars" : "moon";
 const G = PLANET === "mars" ? 3.71 : 1.62;   // m/s²                
 const MASS_PER_NODE = 0.05;      // kg
-const K_CABLE = 500;            // N/m  cable stiffness (for deformation force)
-const K_STRUT = 5000;           // N/m  strut stiffness
-const PRESTRESS_CABLE = 50;     // N  baseline tension every cable carries at rest
-const PRESTRESS_STRUT = -80;    // N  baseline compression every strut carries at rest
+const PRESTRESS_CABLE = 50;     // N  design prestress: mean cable tension at rest
+const HAND_STIFFNESS = 2000;    // N/m  grip: spring between your hand (or mouse) and the grabbed node
+const HAND_DAMPING = 20;        // N·s/m  grip damping, so a carried structure doesn't bounce on the spring
  
 const DEFAULT_STRUCTURE = "prism3";
 let currentStructureId = DEFAULT_STRUCTURE;
@@ -35,14 +35,11 @@ interface PhysicsPoint {
   position: BABYLON.Vector3;
   prevPosition: BABYLON.Vector3;
 }
-interface Constraint {
-  a: number;
-  b: number;
-  restLength: number;     // installed length (NO prestress offset - this is the honest fix)
-  stiffness: number;      // N/m, for the deformation part of the force
-  prestress: number;      // N, baseline force at rest (+tension / -compression)
-  rigid: boolean;         // true = strut, false = cable
-  force: number;          // current display force in N, updated each frame
+// a, b, rigid, EA (N) and restLength L0 (m) come from PMember (physics.ts)
+interface Constraint extends PMember {
+  designLength: number;   // length at the design (equilibrium) shape, m
+  designForce: number;    // prestress force at the design shape, N (+ tension, − compression)
+  force: number;          // current force, N, updated each frame
 }
  
 let points: PhysicsPoint[] = [];
@@ -50,22 +47,31 @@ let constraints: Constraint[] = [];
 let strutMeshes: BABYLON.Mesh[] = [];
 let strutRestLengths: number[] = [];   // cylinder heights at build time, for scaling
 let strutIndexPairs: [number, number][] = [];
-let cableLines: BABYLON.LinesMesh[] = [];
+let cableLines: BABYLON.Mesh[] = [];
 let cableIndexPairs: [number, number][] = [];
 let pointHandles: BABYLON.Mesh[] = [];
+let anchorMeshes: BABYLON.Mesh[] = [];
  
+// An arrow = a shaft (cylinder) + a head (cone). Its BASE sits exactly on `from`,
+// its tip at from + dir·length. The head keeps a fixed size; only the shaft stretches.
+interface Arrow { shaft: BABYLON.Mesh; head: BABYLON.Mesh; headLen: number }
 interface ForceArrow {
-  mesh: BABYLON.Mesh;
+  mesh: Arrow;
   constraintIndex: number;
   end: "a" | "b";
 }
 let forceArrows: ForceArrow[] = [];
-let nodeArrows: BABYLON.Mesh[] = [];
- 
-const MEMBER_ARROW_SCALE = 0.006;  // metres of arrow per newton
-const NODE_ARROW_SCALE = 0.02;
-const MIN_ARROW_LEN = 0.2;
-const MAX_ARROW_LEN = 1.5;
+let nodeArrows: Arrow[] = [];
+
+// Member arrows live INSIDE the member, touching the node:
+//   tension     → points from the node into the member  (the member pulls the node)
+//   compression → points from inside the member to the node (the member pushes the node)
+const MEMBER_ARROW_MAX = 0.12;    // m, arrow for the largest design force
+const NODE_RADIUS = 0.025;        // m, arrows start at the surface of the yellow node spheres
+const NODE_ARROW_SCALE = 0.004;   // m per N, net force on a node
+const NODE_ARROW_MAX = 0.15;      // m
+const NODE_ARROW_MIN_FORCE = 0.3; // N, below this the node is in equilibrium: no arrow
+let forceRef = 1;                 // N, largest |design force| of the current structure
  
 let selectedPointIndex: number | null = null;
 let dragPlane: BABYLON.Plane | null = null;
@@ -73,13 +79,14 @@ let dragPlane: BABYLON.Plane | null = null;
 const xrHeld = new Set<number>();   // nodes currently held by VR hands
 const isHeld = (i: number) => i === selectedPointIndex || xrHeld.has(i);
 
-const DAMPING = 0.98;
-const SUBSTEPS = 6;
 const FIXED_DT = 1 / 60;
 const FLOOR_Y = 0.1;
-const RESTITUTION = 0.15;
 const FRICTION = 0.6;
-const MAX_STEP = 0.5;   // safety clamp: no point may move more than this per frame
+const PHYS_DAMPING = 0.0002; // s  structural damping β: vibrations die out, free motion doesn't (no air on the Moon)
+const PHYS_SUBSTEPS = 2;     // implicit steps per frame
+let anchorSet = new Set<number>();                     // nodes bolted to the ground / test rig
+const holdTargets = new Map<number, BABYLON.Vector3>(); // node → where the hand/mouse wants it
+let prestressStatus = "";
  
 // ============================================================
 // FORCE DENSITY GRAB (NEW, uses fdm.ts)
@@ -94,15 +101,12 @@ let fdm: FDMGrab | null = null;     // null = no usable self-stress for this str
 let fdmQ: number[] = [];            // force density per constraint, same order as `constraints`
 let fdmDragging = false;            // true while the current drag is an FDM drag
 let fdmStatus = "";
-let fdmStatusEl: HTMLDivElement | null = null;
  
-const ANCHOR_TOL = 1e-3;            // nodes within this of the lowest y are anchors (ground)
  
 const toVec3 = (v: BABYLON.Vector3): Vec3 => [v.x, v.y, v.z];
  
-const updateFdmStatus = () => {
-  if (fdmStatusEl) fdmStatusEl.textContent = fdmStatus;
-};
+// the HTML Grab-mode card was removed, so there is no status line to update any more
+const updateFdmStatus = () => {};
  
 // Called after every structure build: find the self-stress q (A q = 0),
 // scale it so the average cable tension = PRESTRESS_CABLE, pick the anchors.
@@ -116,34 +120,20 @@ const setupFDM = () => {
     a: c.a, b: c.b, type: c.rigid ? "bar" : "string",
   }));
  
-  const ss = selfStress(nodes, pairs);
-  if (!ss.exists) {
+  // same prestress as the dynamics: q = t / L from the design forces
+  if (!constraints.some((c) => c.designForce !== 0)) {
     fdmStatus = "FDM off: no self-stress at this geometry";
     updateFdmStatus();
     return;
   }
-  if (!ss.feasible) {
-    fdmStatus = "FDM off: self-stress puts a cable in compression";
-    updateFdmStatus();
-    return;
-  }
- 
-  // q from A q = 0 has no units (any multiple works). Pick the scale so the
-  // mean cable tension t = q·L equals PRESTRESS_CABLE.
-  let tensionSum = 0;
-  let cableCount = 0;
-  pairs.forEach((m, k) => {
-    if (m.type !== "string") return;
-    const L = BABYLON.Vector3.Distance(points[m.a].position, points[m.b].position);
-    tensionSum += ss.q[k] * L;
-    cableCount++;
-  });
-  const scale = PRESTRESS_CABLE / (tensionSum / cableCount);
-  fdmQ = ss.q.map((q) => q * scale);
- 
+  fdmQ = constraints.map((c) => c.designForce / c.designLength);
+
   const members: FDMember[] = pairs.map((m, k) => ({ ...m, q: fdmQ[k] }));
+  // FDM is a static solve: it needs fixed nodes. Use the structure's anchors,
+  // or, for a free structure, the nodes touching the ground right now.
   const minY = Math.min(...nodes.map((n) => n[1]));
-  const anchors = nodes.map((_, i) => i).filter((i) => nodes[i][1] - minY < ANCHOR_TOL);
+  const anchors = anchorSet.size > 0 ? [...anchorSet]
+    : nodes.map((_, i) => i).filter((i) => nodes[i][1] - minY < 1e-3);
  
   fdm = new FDMGrab(nodes, members, anchors);
   fdmStatus = `FDM ready: ${anchors.length} anchor nodes`;
@@ -207,53 +197,35 @@ const computeMinBuckling = (): number => {
   return min;
 };
  
-// ---------- Physics: geometry only (installed rest lengths, no prestress driving it) ----------
-const integrate = (dt: number) => {
-  const gVec = new BABYLON.Vector3(0, -G * dt * dt, 0);
-  points.forEach((p, i) => {
-    if (isHeld(i)) return;
-    const velocity = p.position.subtract(p.prevPosition).scale(DAMPING);
-    const newPos = p.position.add(velocity).add(gVec);
-    // safety clamp to prevent runaway explosion
-    const step = newPos.subtract(p.position);
-    if (step.length() > MAX_STEP) {
-      newPos.copyFrom(p.position.add(step.normalize().scale(MAX_STEP)));
-    }
-    p.prevPosition.copyFrom(p.position);
-    p.position.copyFrom(newPos);
-  });
-};
- 
-const solveConstraints = () => {
+// ---------- Physics: prestressed elastic members, implicit Euler (physics.ts) ----------
+// EA from the chosen materials; rest length L0 so that, at the design shape,
+// every member carries exactly its design prestress (strings short, struts long).
+const updateMemberProperties = () => {
+  const EAstrut = currentStrutMaterial.youngsModulus * CrossSectionArea(currentStrutSection);
   constraints.forEach((c) => {
-    const pA = points[c.a];
-    const pB = points[c.b];
-    const delta = pB.position.subtract(pA.position);
-    const dist = delta.length();
-    if (dist < 0.0001) return;
-    const diff = dist - c.restLength;
-    if (!c.rigid && diff <= 0) return; // cables can't push
-    const correction = delta.scale((diff / dist) * 0.5);
-    if (!isHeld(c.a)) pA.position.addInPlace(correction);
-    if (!isHeld(c.b)) pB.position.subtractInPlace(correction);
-  });
- 
-  points.forEach((p, i) => {
-    if (isHeld(i)) return;
-    if (p.position.y < FLOOR_Y) {
-      const vx = p.position.x - p.prevPosition.x;
-      const vy = p.position.y - p.prevPosition.y;
-      const vz = p.position.z - p.prevPosition.z;
-      p.position.y = FLOOR_Y;
-      p.prevPosition.y = p.position.y + vy * RESTITUTION;
-      p.prevPosition.x = p.position.x - vx * FRICTION;
-      p.prevPosition.z = p.position.z - vz * FRICTION;
+    if (c.rigid) {
+      c.EA = EAstrut;
+    } else {
+      const sec = sizeCable(c.designForce, currentCableMaterial, CABLE_SAFETY_FACTOR, MIN_CABLE_DIAMETER);
+      c.EA = currentCableMaterial.youngsModulus * CrossSectionArea(sec);
     }
+    c.restLength = restLengthFor(c.designLength, c.designForce, c.EA);
+  });
+};
+
+const stepPhysics = (dt: number) => {
+  // forget targets of nodes nobody holds any more
+  for (const i of holdTargets.keys()) if (!isHeld(i)) holdTargets.delete(i);
+  const holds: Hold[] = [...holdTargets].map(([node, target]) => ({ node, target, k: HAND_STIFFNESS, c: HAND_DAMPING }));
+  physicsStep(points, constraints, dt, {
+    g: G, nodeMass: MASS_PER_NODE, floorY: FLOOR_Y, friction: FRICTION,
+    damping: PHYS_DAMPING, substeps: PHYS_SUBSTEPS,
+    isFixed: (i) => anchorSet.has(i), holds,
   });
 };
  
-// ---------- Forces: DISPLAY ONLY, computed from geometry (never fed back into motion) ----------
-// dynamics mode: force = baseline prestress + stiffness * deformation from installed length
+// ---------- Forces ----------
+// dynamics mode: the real member force t = EA (L − L0) / L0 (slack strings = 0)
 // FDM mode (NEW): force = q · L, the member force that is exactly in equilibrium
 const computeForces = () => {
   const useFdm = grabMode === "fdm" && fdm !== null && fdmQ.length === constraints.length;
@@ -263,88 +235,132 @@ const computeForces = () => {
       c.force = fdmQ[i] * L;
       return;
     }
-    const deformation = L - c.restLength;
-    c.force = c.prestress + c.stiffness * deformation;
-    // cables physically cannot go into compression - floor the displayed force at 0
-    if (!c.rigid && c.force < 0) c.force = 0;
+    c.force = memberForce(points, c);
   });
 };
  
-const orientArrow = (mesh: BABYLON.Mesh, origin: BABYLON.Vector3, direction: BABYLON.Vector3, length: number) => {
-  mesh.isVisible = true;
-  mesh.position = origin.add(direction.scale(length / 2));
-  const up = BABYLON.Vector3.Up();
-  const axis = BABYLON.Vector3.Cross(up, direction);
-  const angle = Math.acos(BABYLON.Scalar.Clamp(BABYLON.Vector3.Dot(up, direction), -1, 1));
-  if (axis.length() > 0.0001) {
-    mesh.rotationQuaternion = BABYLON.Quaternion.RotationAxis(axis.normalize(), angle);
-  } else {
-    mesh.rotationQuaternion = BABYLON.Quaternion.Identity();
+const makeArrow = (name: string, mat: BABYLON.Material, shaftD: number, headD: number, headLen: number, scene: BABYLON.Scene): Arrow => {
+  const shaft = BABYLON.MeshBuilder.CreateCylinder(`${name}_shaft`, { height: 1, diameter: shaftD, tessellation: 8 }, scene);
+  shaft.bakeTransformIntoVertices(BABYLON.Matrix.Translation(0, 0.5, 0));   // base at the origin
+  const head = BABYLON.MeshBuilder.CreateCylinder(`${name}_head`, { height: headLen, diameterTop: 0, diameterBottom: headD, tessellation: 12 }, scene);
+  head.bakeTransformIntoVertices(BABYLON.Matrix.Translation(0, headLen / 2, 0));
+  for (const m of [shaft, head]) {
+    m.material = mat;
+    m.isPickable = false;
+    m.isVisible = false;
+    m.rotationQuaternion = BABYLON.Quaternion.Identity();
   }
-  mesh.scaling.y = length;
+  return { shaft, head, headLen };
+};
+
+const hideArrow = (a: Arrow) => { a.shaft.isVisible = false; a.head.isVisible = false; };
+const disposeArrow = (a: Arrow) => { a.shaft.dispose(); a.head.dispose(); };
+
+/** Draw arrow `a` from `from`, pointing along unit vector `dir`, total length `length`. */
+const placeArrow = (a: Arrow, from: BABYLON.Vector3, dir: BABYLON.Vector3, length: number) => {
+  const q = a.shaft.rotationQuaternion!;
+  BABYLON.Quaternion.FromUnitVectorsToRef(BABYLON.Vector3.UpReadOnly, dir, q);
+  a.head.rotationQuaternion!.copyFrom(q);
+  const headLen = Math.min(a.headLen, length * 0.5);
+  const shaftLen = Math.max(length - headLen, 1e-4);
+  a.shaft.position.copyFrom(from);
+  a.shaft.scaling.set(1, shaftLen, 1);
+  a.head.position.copyFrom(from).addInPlace(dir.scale(shaftLen));
+  a.head.scaling.set(1, headLen / a.headLen, 1);
+  a.shaft.isVisible = true;
+  a.head.isVisible = true;
 };
  
+// ============================================================
+// HEAT MAP: colour every member by how hard it is working
+// ============================================================
+// In a pin-jointed tensegrity each member is a two-force member: the axial force
+// is the SAME all along it. So the heat map colours each bar/cable as a whole.
+type HeatMode = "type" | "force" | "utilization";
+let heatMode: HeatMode = "force";
+
+// 0 → blue, 0.25 → cyan, 0.5 → green, 0.75 → yellow, 1 → red
+const HEAT_STOPS = ["#2C7BB6", "#00A6CA", "#7FD18B", "#F9D057", "#D7191C"].map((h) => BABYLON.Color3.FromHexString(h));
+const heatColor = (x: number) => {
+  const t = Math.min(1, Math.max(0, x)) * (HEAT_STOPS.length - 1);
+  const i = Math.min(Math.floor(t), HEAT_STOPS.length - 2);
+  return BABYLON.Color3.Lerp(HEAT_STOPS[i], HEAT_STOPS[i + 1], t - i);
+};
+
+// how loaded member ci is, as a number from 0 (nothing) to 1 (full scale)
+const memberLoad = (ci: number): number => {
+  const c = constraints[ci];
+  if (heatMode === "force") return Math.abs(c.force) / (2 * forceRef);
+  // utilization
+  const L = BABYLON.Vector3.Distance(points[c.a].position, points[c.b].position);
+  if (c.rigid) {
+    const A = CrossSectionArea(currentStrutSection);
+    const yieldCap = currentStrutMaterial.yieldStrength * A;
+    const cap = c.force < 0 ? Math.min(bucklingForce(L, currentStrutMaterial, currentStrutSection), yieldCap) : yieldCap;
+    return Math.abs(c.force) / cap;
+  }
+  const sec = sizeCable(c.designForce, currentCableMaterial, CABLE_SAFETY_FACTOR, MIN_CABLE_DIAMETER);
+  return c.force / (currentCableMaterial.yieldStrength * CrossSectionArea(sec));
+};
+
+const STRUT_COLOR = new BABYLON.Color3(0.9, 0.4, 0.1);
+const CABLE_COLOR = new BABYLON.Color3(0.9, 0.9, 0.9);
+const updateMemberColors = () => {
+  const nStruts = strutMeshes.length;
+  const paint = (mesh: BABYLON.Mesh, ci: number, typeColor: BABYLON.Color3) => {
+    const mat = mesh.material as BABYLON.StandardMaterial;
+    const col = heatMode === "type" ? typeColor : heatColor(memberLoad(ci));
+    mat.diffuseColor = col;
+    mat.emissiveColor = col.scale(heatMode === "type" ? 0.15 : 0.45);   // glows a bit, readable in shadow
+  };
+  strutMeshes.forEach((m, i) => paint(m, i, STRUT_COLOR));
+  cableLines.forEach((m, i) => paint(m, nStruts + i, CABLE_COLOR));
+};
+
+// put a cylinder of height `baseHeight` between a and b
+const placeBetween = (mesh: BABYLON.Mesh, a: BABYLON.Vector3, b: BABYLON.Vector3, baseHeight: number) => {
+  const delta = b.subtract(a);
+  const dist = delta.length();
+  if (dist < 0.0001) return;
+  mesh.position = a.add(b).scale(0.5);
+  mesh.scaling.y = dist / baseHeight;
+  if (!mesh.rotationQuaternion) mesh.rotationQuaternion = new BABYLON.Quaternion();
+  BABYLON.Quaternion.FromUnitVectorsToRef(BABYLON.Vector3.UpReadOnly, delta.scale(1 / dist), mesh.rotationQuaternion);
+};
+
 const updateMeshes = () => {
-  strutIndexPairs.forEach(([ia, ib], i) => {
-    const a = points[ia].position;
-    const b = points[ib].position;
-    const mesh = strutMeshes[i];
-    mesh.position = a.add(b).scale(0.5);
-    const delta = b.subtract(a);
-    const dist = delta.length();
-    if (dist < 0.0001) return;
-    const direction = delta.scale(1 / dist);
-    // struts were built at their installed length; scale so the mesh tracks the
-    // actual current length instead of staying frozen at the build-time height
-    mesh.scaling.y = dist / strutRestLengths[i];
-    const up = BABYLON.Vector3.Up();
-    const axis = BABYLON.Vector3.Cross(up, direction);
-    const angle = Math.acos(BABYLON.Scalar.Clamp(BABYLON.Vector3.Dot(up, direction), -1, 1));
-    if (axis.length() > 0.0001) {
-      mesh.rotationQuaternion = BABYLON.Quaternion.RotationAxis(axis.normalize(), angle);
-    }
-  });
-  cableIndexPairs.forEach(([ia, ib], i) => {
-    const a = points[ia].position;
-    const b = points[ib].position;
-    cableLines[i] = BABYLON.MeshBuilder.CreateLines("cable", {
-      points: [a, b],
-      instance: cableLines[i],
-    }) as BABYLON.LinesMesh;
-  });
+  strutIndexPairs.forEach(([ia, ib], i) =>
+    placeBetween(strutMeshes[i], points[ia].position, points[ib].position, strutRestLengths[i]));
+  cableIndexPairs.forEach(([ia, ib], i) =>
+    placeBetween(cableLines[i], points[ia].position, points[ib].position, 1));
   points.forEach((p, i) => {
     pointHandles[i].position.copyFrom(p.position);
   });
 };
  
 const updateForceArrows = () => {
+  if (heatMode !== "type") { forceArrows.forEach((f) => hideArrow(f.mesh)); return; }
   forceArrows.forEach(({ mesh, constraintIndex, end }) => {
     const c = constraints[constraintIndex];
-    const pA = points[c.a].position;
-    const pB = points[c.b].position;
-    const delta = pB.subtract(pA);
-    const dist = delta.length();
-    if (dist < 0.0001) { mesh.isVisible = false; return; }
-    const unit = delta.scale(1 / dist);
- 
-    const magnitude = Math.abs(c.force);
-    const length = Math.min(MIN_ARROW_LEN + magnitude * MEMBER_ARROW_SCALE, MAX_ARROW_LEN);
- 
-    const tension = c.force > 0;
-    let origin: BABYLON.Vector3;
-    let direction: BABYLON.Vector3;
-    if (end === "a") {
-      origin = pA;
-      direction = tension ? unit : unit.scale(-1);
+    const node = end === "a" ? points[c.a].position : points[c.b].position;
+    const other = end === "a" ? points[c.b].position : points[c.a].position;
+    const toOther = other.subtract(node);
+    const L = toOther.length();
+    if (L < 1e-4 || Math.abs(c.force) < 0.05) { hideArrow(mesh); return; }
+    const inward = toOther.scale(1 / L);                       // from the node into the member
+    const start = node.add(inward.scale(NODE_RADIUS));         // surface of the node sphere
+    const length = Math.min((Math.abs(c.force) / forceRef) * MEMBER_ARROW_MAX, 0.4 * L - NODE_RADIUS);
+    if (length <= 0.005) { hideArrow(mesh); return; }
+    if (c.force > 0) {
+      placeArrow(mesh, start, inward, length);                 // tension: pulls the node inward
     } else {
-      origin = pB;
-      direction = tension ? unit.scale(-1) : unit;
+      placeArrow(mesh, start.add(inward.scale(length)), inward.scale(-1), length);   // compression: pushes on the node
     }
-    orientArrow(mesh, origin, direction, length);
   });
 };
  
 const updateNodeArrows = () => {
+  if (heatMode !== "type") { nodeArrows.forEach(hideArrow); return; }
   points.forEach((p, i) => {
     const net = new BABYLON.Vector3(0, -MASS_PER_NODE * G, 0);
     constraints.forEach((c) => {
@@ -357,11 +373,11 @@ const updateNodeArrows = () => {
       net.addInPlace(unit.scale(c.force));
     });
     const mag = net.length();
-    const mesh = nodeArrows[i];
-    if (mag < 0.0001) { mesh.isVisible = false; return; }
+    const arrow = nodeArrows[i];
+    if (mag < NODE_ARROW_MIN_FORCE) { hideArrow(arrow); return; }   // node in equilibrium
+    const length = Math.min(mag * NODE_ARROW_SCALE, NODE_ARROW_MAX);
     const dir = net.scale(1 / mag);
-    const length = Math.min(MIN_ARROW_LEN + mag * NODE_ARROW_SCALE, MAX_ARROW_LEN);
-    orientArrow(mesh, p.position, dir, length);
+    placeArrow(arrow, p.position.add(dir.scale(NODE_RADIUS)), dir, length);
   });
 };
  
@@ -374,9 +390,9 @@ const updateReadout = () => {
   });
   readoutEl.textContent =
     `g=${G} m/s²  m=${MASS_PER_NODE} kg/node\n` +
-    `K_cable=${K_CABLE} N/m  K_strut=${K_STRUT} N/m\n` +
-    `prestress: cable +${PRESTRESS_CABLE} N, strut ${PRESTRESS_STRUT} N\n` +
-    `forces: ${grabMode === "fdm" && fdm ? "FDM, t = q·L" : "dynamics estimate"}\n` +   // NEW (FDM)
+    `${prestressStatus}\n` +
+    `design: mean cable tension ${PRESTRESS_CABLE} N\n` +
+    `forces: ${grabMode === "fdm" && fdm ? "FDM, t = q·L" : "elastic, t = EA·(L − L0)/L0"}\n` +   // NEW (FDM)
     `\nMax cable tension: ${cablePeakTension.toFixed(1)} N\n` +
     `Max strut compression: ${strutPeakCompression.toFixed(1)} N`;
 };
@@ -394,6 +410,7 @@ let sharedMats: {
   tension: BABYLON.StandardMaterial;
   comp: BABYLON.StandardMaterial;
   node: BABYLON.StandardMaterial;
+  anchor: BABYLON.StandardMaterial;
 } | null = null;
  
 const initMaterials = (scene: BABYLON.Scene) => {
@@ -418,16 +435,22 @@ const initMaterials = (scene: BABYLON.Scene) => {
   node.diffuseColor = new BABYLON.Color3(0.2, 1, 0.4);
   node.emissiveColor = new BABYLON.Color3(0.1, 0.4, 0.15);
  
-  sharedMats = { strut, handle, tension, comp, node };
+  const anchor = new BABYLON.StandardMaterial("anchorMat", scene);
+  anchor.diffuseColor = new BABYLON.Color3(0.22, 0.24, 0.28);
+  anchor.specularColor = new BABYLON.Color3(0.4, 0.4, 0.45);
+
+  sharedMats = { strut, handle, tension, comp, node, anchor };
   return sharedMats;
 };
  
 const clearCurrentStructure = () => {
-  strutMeshes.forEach((m) => m.dispose());
-  cableLines.forEach((l) => l.dispose());
+  strutMeshes.forEach((m) => m.dispose(false, true));   // true = also dispose its own material
+  cableLines.forEach((m) => m.dispose(false, true));
   pointHandles.forEach((h) => h.dispose());
-  forceArrows.forEach((a) => a.mesh.dispose());
-  nodeArrows.forEach((a) => a.dispose());
+  anchorMeshes.forEach((m) => m.dispose());
+  anchorMeshes = [];
+  forceArrows.forEach((a) => disposeArrow(a.mesh));
+  nodeArrows.forEach(disposeArrow);
  
   strutMeshes = [];
   strutRestLengths = [];
@@ -461,18 +484,20 @@ const buildTensegrityStructure = (scene: BABYLON.Scene, def: StructureDef) => {
   strutIndexPairs = def.strutIndexPairs.map(([a, b]) => [a, b] as [number, number]);
   cableIndexPairs = def.cableIndexPairs.map(([a, b]) => [a, b] as [number, number]);
  
-  // NOTE: restLength = installed length (NOT offset). Prestress is a force baseline for
-  // DISPLAY, stored separately - it does not distort the geometry the solver targets.
-  constraints = [
-    ...strutIndexPairs.map(([a, b]) => {
-      const installed = BABYLON.Vector3.Distance(points[a].position, points[b].position);
-      return { a, b, rigid: true, stiffness: K_STRUT, restLength: installed, prestress: PRESTRESS_STRUT, force: 0 };
-    }),
-    ...cableIndexPairs.map(([a, b]) => {
-      const installed = BABYLON.Vector3.Distance(points[a].position, points[b].position);
-      return { a, b, rigid: false, stiffness: K_CABLE, restLength: installed, prestress: PRESTRESS_CABLE, force: 0 };
-    }),
+  // Members + design prestress (self-stress closest to "bars push, strings pull")
+  anchorSet = new Set(def.anchors);
+  holdTargets.clear();
+  const pairs = [
+    ...strutIndexPairs.map(([a, b]) => ({ a, b, rigid: true })),
+    ...cableIndexPairs.map(([a, b]) => ({ a, b, rigid: false })),
   ];
+  const design = designPrestress(points.map((p) => p.position), pairs, PRESTRESS_CABLE);
+  prestressStatus = design.ok ? design.message : `NO prestress: ${design.message}`;
+  constraints = pairs.map((m, k) => {
+    const L = BABYLON.Vector3.Distance(points[m.a].position, points[m.b].position);
+    return { ...m, EA: 1, restLength: L, designLength: L, designForce: design.forces[k], force: design.forces[k] };
+  });
+  updateMemberProperties();
  
   strutRestLengths = strutIndexPairs.map(([a, b]) =>
     BABYLON.Vector3.Distance(points[a].position, points[b].position)
@@ -481,16 +506,17 @@ const buildTensegrityStructure = (scene: BABYLON.Scene, def: StructureDef) => {
   strutMeshes = strutIndexPairs.map((_pair, i) => {
     const mesh = BABYLON.MeshBuilder.CreateCylinder(
       `${def.id}_strut${i}`, { height: strutRestLengths[i], diameter: 0.015 }, scene);
-    mesh.material = mats.strut;
+    mesh.material = mats.strut.clone(`${def.id}_strutMat${i}`);   // own material → own heat colour
     return mesh;
   });
  
-  cableLines = cableIndexPairs.map(([a, b], i) =>
-    BABYLON.MeshBuilder.CreateLines(`${def.id}_cable${i}`, {
-      points: [points[a].position, points[b].position], updatable: true,
-    }, scene)
-  );
-  cableLines.forEach((l) => (l.color = new BABYLON.Color3(0.9, 0.9, 0.9)));
+  cableLines = cableIndexPairs.map((_pair, i) => {
+    const mesh = BABYLON.MeshBuilder.CreateCylinder(
+      `${def.id}_cable${i}`, { height: 1, diameter: 0.004, tessellation: 8 }, scene);
+    mesh.material = mats.strut.clone(`${def.id}_cableMat${i}`);
+    mesh.isPickable = false;
+    return mesh;
+  });
  
   pointHandles = points.map((p, i) => {
     const h = BABYLON.MeshBuilder.CreateSphere(`${def.id}_handle${i}`, { diameter: 0.05 }, scene);
@@ -499,24 +525,37 @@ const buildTensegrityStructure = (scene: BABYLON.Scene, def: StructureDef) => {
     return h;
   });
  
+  // anchors: dark blocks, plus a support post when the anchor is off the ground (test rig)
+  anchorMeshes = [];
+  def.anchors.forEach((i) => {
+    const p = points[i].position;
+    const block = BABYLON.MeshBuilder.CreateBox(`${def.id}_anchor${i}`, { size: 0.04 }, scene);
+    block.position = p.clone();
+    block.material = mats.anchor;
+    block.isPickable = false;
+    anchorMeshes.push(block);
+    const postH = p.y - FLOOR_Y;
+    if (postH > 0.03) {
+      const post = BABYLON.MeshBuilder.CreateCylinder(`${def.id}_post${i}`, { height: postH, diameter: 0.015 }, scene);
+      post.position = new BABYLON.Vector3(p.x, FLOOR_Y + postH / 2, p.z);
+      post.material = mats.anchor;
+      post.isPickable = false;
+      anchorMeshes.push(post);
+    }
+  });
+
+  forceRef = Math.max(1, ...constraints.map((c) => Math.abs(c.designForce)));
+  refreshHeatLegend();
   forceArrows = [];
   constraints.forEach((c, ci) => {
     (["a", "b"] as const).forEach((end) => {
-      const arrow = BABYLON.MeshBuilder.CreateCylinder(`${def.id}_arrow${ci}${end}`,
-        { height: 0.5, diameterTop: 0, diameterBottom: 0.007 }, scene);
-      arrow.material = c.rigid ? mats.comp : mats.tension;
-      arrow.isVisible = false;
+      const arrow = makeArrow(`${def.id}_arrow${ci}${end}`, c.rigid ? mats.comp : mats.tension,
+        c.rigid ? 0.006 : 0.004, c.rigid ? 0.022 : 0.016, 0.03, scene);
       forceArrows.push({ mesh: arrow, constraintIndex: ci, end });
     });
   });
  
-  nodeArrows = points.map((_, i) => {
-    const arrow = BABYLON.MeshBuilder.CreateCylinder(`${def.id}_node${i}`,
-      { height: 0.5, diameterTop: 0, diameterBottom: 0.011 }, scene);
-    arrow.material = mats.node;
-    arrow.isVisible = false;
-    return arrow;
-  });
+  nodeArrows = points.map((_, i) => makeArrow(`${def.id}_node${i}`, mats.node, 0.005, 0.018, 0.03, scene));
  
   setupFDM();   // NEW (FDM): self-stress + anchors for this structure
 };
@@ -524,119 +563,102 @@ const buildTensegrityStructure = (scene: BABYLON.Scene, def: StructureDef) => {
 // ============================================================
 // GUI
 // ============================================================
+let refreshHeatLegend = () => {};
 const setupGUI = (scene: BABYLON.Scene) => {
   const overlay = document.createElement("div");
-  overlay.style.cssText =
-    "position:fixed;top:12px;left:12px;padding:12px 14px;" +
-    "background:rgba(20,20,35,0.82);color:white;font-family:sans-serif;" +
-    "font-size:13px;line-height:1.5;border-radius:8px;" +
-    "white-space:pre;z-index:10;";
-  const legend =
-    `<div style="display:flex;align-items:center;margin-bottom:4px;">` +
-    `<span style="width:16px;height:16px;background:#3366ff;display:inline-block;margin-right:8px;border-radius:3px;"></span>Tension (cables)</div>` +
-    `<div style="display:flex;align-items:center;margin-bottom:4px;">` +
-    `<span style="width:16px;height:16px;background:#ff3333;display:inline-block;margin-right:8px;border-radius:3px;"></span>Compression (struts)</div>` +
-    `<div style="display:flex;align-items:center;margin-bottom:8px;">` +
-    `<span style="width:16px;height:16px;background:#33ff66;display:inline-block;margin-right:8px;border-radius:3px;"></span>Net force at node</div>`;
+  overlay.className = "gui";                       // all the styling lives in style.css
+  overlay.innerHTML = `<div class="gui-header">Tensegrity Lab</div>`;
+
+  // a rounded card with a small grey title; returns the card so we can fill it
+  const card = (title: string) => {
+    const c = document.createElement("div");
+    c.className = "gui-card";
+    c.innerHTML = `<div class="gui-title">${title}</div>`;
+    overlay.appendChild(c);
+    return c;
+  };
+
+  // --- Forces ---
+  const forcesCard = card("Forces");
+  forcesCard.innerHTML +=
+    `<div id="arrowLegend">` +
+    `<div class="gui-legend"><span class="gui-dot" style="background:#3366ff"></span>Tension (cables)</div>` +
+    `<div class="gui-legend"><span class="gui-dot" style="background:#ff3333"></span>Compression (struts)</div>` +
+    `<div class="gui-legend"><span class="gui-dot" style="background:#33ff66"></span>Net force at node</div>` +
+    `</div>`;
   const readout = document.createElement("div");
-  overlay.innerHTML = legend;
-  overlay.appendChild(readout);
+  readout.className = "gui-readout";
+  forcesCard.appendChild(readout);
+
+  // --- Force view: arrows OR heat map ---
+  const heatCard = card("Force view");
+  const heatRow = document.createElement("div");
+  heatRow.className = "gui-seg";
+  const heatBar = document.createElement("div");
+  heatBar.className = "gui-heatbar";
+  const heatLabels = document.createElement("div");
+  heatLabels.className = "gui-heatlabels";
+  const renderHeat = () => {
+    Array.from(heatRow.children).forEach((c) =>
+      c.classList.toggle("active", (c as HTMLElement).dataset.mode === heatMode));
+    heatBar.style.display = heatLabels.style.display = heatMode === "type" ? "none" : "";
+    heatLabels.innerHTML = heatMode === "force"
+      ? `<span>0 N</span><span>${forceRef.toFixed(0)} N</span><span>${(2 * forceRef).toFixed(0)} N</span>`
+      : `<span>0 %</span><span>50 %</span><span>100 % = fails</span>`;
+    const legend = document.getElementById("arrowLegend");
+    if (legend) legend.style.display = heatMode === "type" ? "" : "none";
+  };
+  ([["type", "Arrows"], ["force", "Heat: force"], ["utilization", "Heat: use"]] as [HeatMode, string][]).forEach(([mode, label]) => {
+    const b = document.createElement("button");
+    b.className = "gui-btn";
+    b.textContent = label;
+    b.dataset.mode = mode;
+    b.addEventListener("click", () => { heatMode = mode; renderHeat(); });
+    heatRow.appendChild(b);
+  });
+  heatCard.append(heatRow, heatBar, heatLabels);
+  refreshHeatLegend = renderHeat;   // so a new structure updates the N labels
  
   // --- Structure menu ---
-  const structTitle = document.createElement("div");
-  structTitle.textContent = "Structure";
-  structTitle.style.cssText = "margin-top:10px;margin-bottom:6px;font-weight:600;";
-  overlay.appendChild(structTitle);
- 
   const structRow = document.createElement("div");
-  structRow.style.cssText = "display:flex;flex-direction:column;gap:4px;margin-bottom:8px;";
+  structRow.className = "gui-list";
   listStructures().forEach(({ id, name }) => {
     const btn = document.createElement("button");
     btn.textContent = name;
-    btn.style.cssText =
-      "text-align:left;padding:5px 8px;font-size:12px;border-radius:5px;cursor:pointer;" +
-      "border:1px solid #444;background:#2a2f38;color:#e8e6e0;";
-    if (id === DEFAULT_STRUCTURE) btn.style.background = "#3a6ea5";
+    btn.className = "gui-btn";
+    btn.classList.toggle("active", id === DEFAULT_STRUCTURE);
     btn.addEventListener("click", () => {
       buildTensegrityStructure(scene, getStructure(id));
-      Array.from(structRow.children).forEach((c) =>
-        ((c as HTMLElement).style.background = "#2a2f38"));
-      btn.style.background = "#3a6ea5";
+      Array.from(structRow.children).forEach((c) => c.classList.remove("active"));
+      btn.classList.add("active");
       updateMassReadout();
     });
     structRow.appendChild(btn);
   });
-  overlay.appendChild(structRow);
- 
-  // --- Grab mode (NEW, FDM) ---
-  const grabTitle = document.createElement("div");
-  grabTitle.textContent = "Grab mode";
-  grabTitle.style.cssText = "margin-top:10px;margin-bottom:6px;font-weight:600;";
-  overlay.appendChild(grabTitle);
- 
-  const grabBtn = document.createElement("button");
-  grabBtn.style.cssText =
-    "text-align:left;padding:5px 8px;font-size:12px;border-radius:5px;cursor:pointer;" +
-    "border:1px solid #444;background:#2a2f38;color:#e8e6e0;width:100%;";
-  const renderGrabBtn = () => {
-    grabBtn.textContent = grabMode === "fdm" ? "Force density (physics paused)" : "Dynamics";
-    grabBtn.style.background = grabMode === "fdm" ? "#3a6ea5" : "#2a2f38";
-  };
-  grabBtn.addEventListener("click", () => {
-    grabMode = grabMode === "fdm" ? "dynamics" : "fdm";
-    // leaving FDM: zero the velocities so Verlet doesn't see a jump
-    if (grabMode === "dynamics") points.forEach((p) => p.prevPosition.copyFrom(p.position));
-    renderGrabBtn();
-  });
-  renderGrabBtn();
-  overlay.appendChild(grabBtn);
- 
-  const fdmStatusDiv = document.createElement("div");
-  fdmStatusDiv.style.cssText = "font-size:11px;color:#aab;margin-top:4px;margin-bottom:8px;";
-  overlay.appendChild(fdmStatusDiv);
-  fdmStatusEl = fdmStatusDiv;
-  updateFdmStatus();
- 
+  card("Structure").appendChild(structRow);
+  
   // --- Material menu ---
-  const matTitle = document.createElement("div");
-  matTitle.textContent = "Material";
-  matTitle.style.cssText = "margin-top:10px;margin-bottom:6px;font-weight:600;";
-  overlay.appendChild(matTitle);
- 
   const btnRow = document.createElement("div");
-  btnRow.style.cssText = "display:flex;flex-direction:column;gap:4px;margin-bottom:8px;";
+  btnRow.className = "gui-list";
   MATERIALS.forEach((m) => {
     const btn = document.createElement("button");
     btn.textContent = m.name;
-    btn.style.cssText =
-      "text-align:left;padding:5px 8px;font-size:12px;border-radius:5px;cursor:pointer;" +
-      "border:1px solid #444;background:#2a2f38;color:#e8e6e0;";
-    if (m.id === currentStrutMaterial.id) btn.style.background = "#c9a227";
+    btn.className = "gui-btn";
+    btn.classList.toggle("gold", m.id === currentStrutMaterial.id);
     btn.addEventListener("click", () => {
       currentStrutMaterial = m;
       // highlight the active button
-      Array.from(btnRow.children).forEach((c) =>
-        ((c as HTMLElement).style.background = "#2a2f38"));
-      btn.style.background = "#c9a227";
+      Array.from(btnRow.children).forEach((c) => c.classList.remove("gold"));
+      btn.classList.add("gold");
       updateMassReadout();
     });
     btnRow.appendChild(btn);
   });
-  overlay.appendChild(btnRow);
+  card("Strut material").appendChild(btnRow);
  
   // --- Cross-section menu ---
-  // All of this is LOCAL to setupGUI: the elements are created here, so the
-  // closures below always have real elements to talk to. Nothing is looked up
-  // with getElementById, which is what blanked the page before.
-  const shapeTitle = document.createElement("div");
-  shapeTitle.textContent = "Cross-section";
-  shapeTitle.style.cssText = "margin-top:10px;margin-bottom:6px;font-weight:600;";
-  overlay.appendChild(shapeTitle);
- 
+  const sectionCard = card("Cross-section");
   const shapeSelect = document.createElement("select");
-  shapeSelect.style.cssText =
-    "width:100%;padding:5px 8px;font-size:12px;border-radius:5px;" +
-    "border:1px solid #444;background:#2a2f38;color:#e8e6e0;margin-bottom:6px;";
   for (const kind of Object.keys(SECTION_FIELDS)) {
     const opt = document.createElement("option");
     opt.value = kind;
@@ -645,11 +667,10 @@ const setupGUI = (scene: BABYLON.Scene) => {
   }
   // start the dropdown on whatever currentStrutSection already is
   shapeSelect.value = currentStrutSection.kind;
-  overlay.appendChild(shapeSelect);
- 
+  sectionCard.appendChild(shapeSelect);
+
   const shapeFields = document.createElement("div");
-  shapeFields.style.cssText = "display:flex;flex-direction:column;gap:4px;margin-bottom:8px;";
-  overlay.appendChild(shapeFields);
+  sectionCard.appendChild(shapeFields);
  
   // Build a CrossSection object out of whatever inputs are currently on screen.
   // The `as CrossSection` cast is the one unchecked seam: the values come from
@@ -674,20 +695,15 @@ const setupGUI = (scene: BABYLON.Scene) => {
     for (const f of SECTION_FIELDS[kind]) {
       const label = document.createElement("label");
       label.textContent = f.label;
-      label.style.cssText =
-        "font-size:12px;display:flex;justify-content:space-between;align-items:center;gap:8px;";
- 
+
       const input = document.createElement("input");
       input.type = "number";
       input.step = "0.001";
       input.min = "0.0001";
       input.value = String(f.default);
       input.dataset.key = f.key;     // remembers which CrossSection field this is
-      input.style.cssText =
-        "width:80px;padding:2px 4px;font-size:12px;border-radius:4px;" +
-        "border:1px solid #444;background:#2a2f38;color:#e8e6e0;";
       input.addEventListener("input", onSectionChange);
- 
+
       label.appendChild(input);
       shapeFields.appendChild(label);
     }
@@ -702,16 +718,18 @@ const setupGUI = (scene: BABYLON.Scene) => {
   onSectionChange();
  
   const massReadout = document.createElement("div");
-  massReadout.style.cssText = "font-family:monospace;font-size:13px;color:#c9a227;";
-  overlay.appendChild(massReadout);
+  massReadout.className = "gui-mono";
+  card("Mass & buckling").appendChild(massReadout);
   massReadoutEl = massReadout;
  
   document.body.appendChild(overlay);
+  renderHeat();                     // now #arrowLegend is on the page
   readoutEl = readout;
   updateMassReadout();
 };
  
 const updateMassReadout = () => {
+  updateMemberProperties();   // material / section may have changed → new EA, same prestress
   if (!massReadoutEl) return;
  
   const m = ComputeMassBreakdown();
@@ -735,7 +753,6 @@ const updateMassReadout = () => {
     `Status: ${safe ? "OK" : "BUCKLES ⚠"}`;
 };
  
-// Moves the grabbed node to newPos (mouse or VR hand)
 // Moves node `index` to newPos (mouse or VR hand).
 // viaFdm = true: one FDM solve moves every free node to equilibrium.
 const moveNode = (index: number, newPos: BABYLON.Vector3, viaFdm: boolean) => {
@@ -746,8 +763,8 @@ const moveNode = (index: number, newPos: BABYLON.Vector3, viaFdm: boolean) => {
       points[i].prevPosition.copyFrom(points[i].position);
     });
   } else {
-    points[index].position.copyFrom(newPos);
-    points[index].prevPosition.copyFrom(newPos);
+    // dynamics: don't teleport the node — pull it with a spring (HAND_STIFFNESS)
+    holdTargets.set(index, newPos.clone());
   }
 };
 
@@ -811,6 +828,7 @@ const findNearestNode = (pos: BABYLON.Vector3): number | null => {
   let best: number | null = null;
   let bestDist = GRAB_RADIUS;
   for (let i = 0; i < points.length; i++) {
+    if (anchorSet.has(i)) continue;              // anchors are bolted down
     const d = BABYLON.Vector3.Distance(points[i].position, pos);
     if (d < bestDist) { bestDist = d; best = i; }
   }
@@ -820,7 +838,8 @@ const findNearestNode = (pos: BABYLON.Vector3): number | null => {
 // ============================================================
 // VR PANEL: connects the 3D panel (vrPanel.ts) to the simulator state
 // ============================================================
-const makeVRPanelAPI = (scene: BABYLON.Scene, exitVR: () => void): VRPanelAPI => ({  structures: listStructures(),
+const makeVRPanelAPI = (scene: BABYLON.Scene, exitVR: () => void): VRPanelAPI => ({
+  structures: listStructures(),
   materials: MATERIALS.map((m) => ({ id: m.id, name: m.name })),
   sectionKinds: Object.keys(SECTION_FIELDS),
 
@@ -836,7 +855,7 @@ const makeVRPanelAPI = (scene: BABYLON.Scene, exitVR: () => void): VRPanelAPI =>
       structureId: currentStructureId,
       materialId: currentStrutMaterial.id,
       grabMode,
-      fdmStatus,
+      fdmStatus: grabMode === "fdm" ? fdmStatus : prestressStatus,
       planet: PLANET,
       g: G,
       sectionKind: currentStrutSection.kind,
@@ -879,7 +898,6 @@ const makeVRPanelAPI = (scene: BABYLON.Scene, exitVR: () => void): VRPanelAPI =>
     updateMassReadout();
   },
   setPlanet: (p) => { window.location.search = `?planet=${p}`; },
-    setPlanet: (p) => { window.location.search = `?planet=${p}`; },
   exitVR,
 });
 
@@ -1005,8 +1023,8 @@ const setupXR = async (scene: BABYLON.Scene, floor: BABYLON.AbstractMesh) => {
       updateGrabber(grabbers.right);
     });
 
-           // the menu console: only visible inside VR
-        const panel = createVRPanel(scene, makeVRPanelAPI(scene, () => { void xr.baseExperience.exitXRAsync(); }));
+    // the menu console: only visible inside VR
+    const panel = createVRPanel(scene, makeVRPanelAPI(scene, () => { void xr.baseExperience.exitXRAsync(); }));
     panel.setVisible(false);
 
     const placeConsole = () => {
@@ -1035,6 +1053,8 @@ const setupXR = async (scene: BABYLON.Scene, floor: BABYLON.AbstractMesh) => {
       if (state === BABYLON.WebXRState.IN_XR) placeConsole();          // backup, in case the pose event is missed
       if (state === BABYLON.WebXRState.NOT_IN_XR) panel.setVisible(false);
     });
+
+    return xr;
   } catch (e) {
     console.warn("XR not available:", e);
   }
@@ -1067,7 +1087,8 @@ const addMountainSilhouettes = (scene: BABYLON.Scene, horizon: BABYLON.Color3) =
       let h = baseH * ( 0.04 + 0.6 * rough);
       massifs.forEach((m) => {
         const d = ((azDeg - m.az + 540) % 360) - 180;            // angular distance, -180..180
-  h += m.height * Math.exp(-((d / m.width) ** 2)) * (0.55 + 0.45 * rough);      });
+        h += m.height * Math.exp(-((d / m.width) ** 2)) * (0.55 + 0.45 * rough);
+      });
       const x = Math.sin(a) * radius, z = Math.cos(a) * radius;  // same convention as the sun
       top.push(new BABYLON.Vector3(x, h, z));
       bottom.push(new BABYLON.Vector3(x, -400, z));
@@ -1100,7 +1121,7 @@ const addMountainSilhouettes = (scene: BABYLON.Scene, horizon: BABYLON.Color3) =
   ], 30, 0.7, 7);
 
   // NEAR range: lower, darker hills, continuing the valley walls around you
-    ring("nearRidges", 3400, [
+  ring("nearRidges", 3400, [
     { az: 0,   width: 20, height: 200 },
     { az: 45,  width: 15, height: 160 },
     { az: 90,  width: 22, height: 220 },
@@ -1313,14 +1334,11 @@ const MASS_READOUT_INTERVAL = 15;
 engine.runRenderLoop(() => {
   // NEW (FDM): physics only runs in dynamics mode; FDM mode is static form-finding
   if (grabMode === "dynamics") {
-    integrate(FIXED_DT);
-    const passes = selectedPointIndex !== null || xrHeld.size > 0 ? 3 : SUBSTEPS;
-    for (let i = 0; i < passes; i++) {
-      solveConstraints();
-    }
+    stepPhysics(FIXED_DT);
   }
   computeForces();
   updateMeshes();
+  updateMemberColors();
   updateForceArrows();
   updateNodeArrows();
   updateReadout();

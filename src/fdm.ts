@@ -38,7 +38,7 @@ export function buildK(j: number, members: FDMember[]): number[][] {
 // so Cholesky is not safe. LU with pivoting is.
 interface LU { lu: number[][]; piv: number[]; }
  
-function luFactor(A: number[][], relTol = 1e-10): LU {
+export function luFactor(A: number[][], relTol = 1e-10): LU {
   const n = A.length;
   const lu = A.map(row => row.slice());
   const piv = Array.from({ length: n }, (_, i) => i);
@@ -67,7 +67,7 @@ function luFactor(A: number[][], relTol = 1e-10): LU {
   return { lu, piv };
 }
  
-function luSolve({ lu, piv }: LU, b: number[]): number[] {
+export function luSolve({ lu, piv }: LU, b: number[]): number[] {
   const n = lu.length;
   const x = piv.map(i => b[i]);
   for (let i = 0; i < n; i++) {
@@ -258,7 +258,7 @@ export interface SelfStressResult {
 }
  
 /** Jacobi eigenvalue method for a small symmetric matrix. Returns eigenvalues and eigenvectors (columns). */
-function jacobiEigen(S: number[][], sweeps = 100): { values: number[]; vectors: number[][] } {
+export function jacobiEigen(S: number[][], sweeps = 100): { values: number[]; vectors: number[][] } {
   const n = S.length;
   const a = S.map(r => r.slice());
   const v: number[][] = Array.from({ length: n }, (_, i) =>
