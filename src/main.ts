@@ -8,7 +8,8 @@ import { createMoonEnvironment, type MoonEnvironment } from "./moonEnvironment";
 import { createSubstitutionPanel } from "./substitutionPanel";
 import { substituteAll, type Topology } from "./substitution";
 import { FDMGrab, selfStress, type FDMember, type MemberPair, type Vec3 } from "./fdm"; // NEW (FDM)
- 
+import { createVRPanel, type VRPanelAPI } from "./vrPanel"; 
+
 const canvas = document.getElementById("renderCanvas") as HTMLCanvasElement;
 const engine = new BABYLON.Engine(canvas, true);
  
@@ -27,7 +28,8 @@ const PRESTRESS_CABLE = 50;     // N  baseline tension every cable carries at re
 const PRESTRESS_STRUT = -80;    // N  baseline compression every strut carries at rest
  
 const DEFAULT_STRUCTURE = "prism3";
- 
+let currentStructureId = DEFAULT_STRUCTURE;
+
 // ---------- Physics state ----------
 interface PhysicsPoint {
   position: BABYLON.Vector3;
@@ -68,6 +70,9 @@ const MAX_ARROW_LEN = 1.5;
 let selectedPointIndex: number | null = null;
 let dragPlane: BABYLON.Plane | null = null;
  
+const xrHeld = new Set<number>();   // nodes currently held by VR hands
+const isHeld = (i: number) => i === selectedPointIndex || xrHeld.has(i);
+
 const DAMPING = 0.98;
 const SUBSTEPS = 6;
 const FIXED_DT = 1 / 60;
@@ -206,7 +211,7 @@ const computeMinBuckling = (): number => {
 const integrate = (dt: number) => {
   const gVec = new BABYLON.Vector3(0, -G * dt * dt, 0);
   points.forEach((p, i) => {
-    if (i === selectedPointIndex) return;
+    if (isHeld(i)) return;
     const velocity = p.position.subtract(p.prevPosition).scale(DAMPING);
     const newPos = p.position.add(velocity).add(gVec);
     // safety clamp to prevent runaway explosion
@@ -229,12 +234,12 @@ const solveConstraints = () => {
     const diff = dist - c.restLength;
     if (!c.rigid && diff <= 0) return; // cables can't push
     const correction = delta.scale((diff / dist) * 0.5);
-    if (c.a !== selectedPointIndex) pA.position.addInPlace(correction);
-    if (c.b !== selectedPointIndex) pB.position.subtractInPlace(correction);
+    if (!isHeld(c.a)) pA.position.addInPlace(correction);
+    if (!isHeld(c.b)) pB.position.subtractInPlace(correction);
   });
  
   points.forEach((p, i) => {
-    if (i === selectedPointIndex) return;
+    if (isHeld(i)) return;
     if (p.position.y < FLOOR_Y) {
       const vx = p.position.x - p.prevPosition.x;
       const vy = p.position.y - p.prevPosition.y;
@@ -437,11 +442,13 @@ const clearCurrentStructure = () => {
  
   // a dragged handle no longer exists after a swap
   selectedPointIndex = null;
+  xrHeld.clear();
   dragPlane = null;
   fdmDragging = false;   // NEW (FDM)
 };
  
 const buildTensegrityStructure = (scene: BABYLON.Scene, def: StructureDef) => {
+  currentStructureId = def.id;
   clearCurrentStructure();
   const mats = initMaterials(scene);
  
@@ -728,6 +735,22 @@ const updateMassReadout = () => {
     `Status: ${safe ? "OK" : "BUCKLES ⚠"}`;
 };
  
+// Moves the grabbed node to newPos (mouse or VR hand)
+// Moves node `index` to newPos (mouse or VR hand).
+// viaFdm = true: one FDM solve moves every free node to equilibrium.
+const moveNode = (index: number, newPos: BABYLON.Vector3, viaFdm: boolean) => {
+  if (viaFdm && fdm) {
+    const solved = fdm.drag(toVec3(newPos));
+    solved.forEach((n, i) => {
+      points[i].position.set(n[0], n[1], n[2]);
+      points[i].prevPosition.copyFrom(points[i].position);
+    });
+  } else {
+    points[index].position.copyFrom(newPos);
+    points[index].prevPosition.copyFrom(newPos);
+  }
+};
+
 const setupDragInteraction = (scene: BABYLON.Scene, camera: BABYLON.ArcRotateCamera) => {
   scene.onPointerObservable.add((pointerInfo) => {
     switch (pointerInfo.type) {
@@ -761,18 +784,7 @@ const setupDragInteraction = (scene: BABYLON.Scene, camera: BABYLON.ArcRotateCam
           const ray = scene.createPickingRay(scene.pointerX, scene.pointerY, BABYLON.Matrix.Identity(), camera);
           const distance = ray.intersectsPlane(dragPlane);
           if (distance !== null) {
-            const newPos = ray.origin.add(ray.direction.scale(distance));
-            if (fdmDragging && fdm) {
-              // NEW (FDM): one linear solve moves ALL free nodes to equilibrium
-              const solved = fdm.drag(toVec3(newPos));
-              solved.forEach((n, i) => {
-                points[i].position.set(n[0], n[1], n[2]);
-                points[i].prevPosition.copyFrom(points[i].position);
-              });
-            } else {
-              points[selectedPointIndex].position.copyFrom(newPos);
-              points[selectedPointIndex].prevPosition.copyFrom(newPos);
-            }
+            moveNode(selectedPointIndex, ray.origin.add(ray.direction.scale(distance)), fdmDragging);
           }
         }
         break;
@@ -788,39 +800,245 @@ const setupDragInteraction = (scene: BABYLON.Scene, camera: BABYLON.ArcRotateCam
     }
   });
 };
+
+const GRAB_RADIUS = 0.06;   // 6 cm: how close the hand must be to a node
+ 
+
+const handPosition = (c: BABYLON.WebXRInputSource) =>
+  (c.grip ?? c.pointer).getAbsolutePosition();
+
+const findNearestNode = (pos: BABYLON.Vector3): number | null => {
+  let best: number | null = null;
+  let bestDist = GRAB_RADIUS;
+  for (let i = 0; i < points.length; i++) {
+    const d = BABYLON.Vector3.Distance(points[i].position, pos);
+    if (d < bestDist) { bestDist = d; best = i; }
+  }
+  return best;
+};
+
+// ============================================================
+// VR PANEL: connects the 3D panel (vrPanel.ts) to the simulator state
+// ============================================================
+const makeVRPanelAPI = (scene: BABYLON.Scene, exitVR: () => void): VRPanelAPI => ({  structures: listStructures(),
+  materials: MATERIALS.map((m) => ({ id: m.id, name: m.name })),
+  sectionKinds: Object.keys(SECTION_FIELDS),
+
+  getState: () => {
+    let cableMax = 0, strutMax = 0;
+    constraints.forEach((c) => {
+      if (c.rigid) strutMax = Math.max(strutMax, -c.force);
+      else cableMax = Math.max(cableMax, c.force);
+    });
+    const m = ComputeMassBreakdown();
+    const sec = currentStrutSection as unknown as Record<string, number>;
+    return {
+      structureId: currentStructureId,
+      materialId: currentStrutMaterial.id,
+      grabMode,
+      fdmStatus,
+      planet: PLANET,
+      g: G,
+      sectionKind: currentStrutSection.kind,
+      sectionFields: SECTION_FIELDS[currentStrutSection.kind].map((f) => ({
+        key: f.key, label: f.label, value: sec[f.key],
+      })),
+      cableMax,
+      strutMax,
+      bucklingLimit: computeMinBuckling(),
+      massStruts: m.struts,
+      massCables: m.cables,
+      massNodes: m.nodes,
+    };
+  },
+
+  setStructure: (id) => {
+    buildTensegrityStructure(scene, getStructure(id));
+    updateMassReadout();
+  },
+  setMaterial: (id) => {
+    const m = getMaterialById(id);
+    if (m) currentStrutMaterial = m;
+    updateMassReadout();
+  },
+  toggleGrabMode: () => {
+    grabMode = grabMode === "fdm" ? "dynamics" : "fdm";
+    if (grabMode === "dynamics") points.forEach((p) => p.prevPosition.copyFrom(p.position));
+  },
+  setSectionKind: (kind) => {
+    const k = kind as CrossSection["kind"];
+    const obj: Record<string, unknown> = { kind: k };
+    SECTION_FIELDS[k].forEach((f) => (obj[f.key] = f.default));
+    currentStrutSection = obj as CrossSection;
+    updateMassReadout();
+  },
+  scaleSectionField: (key, factor) => {
+    const sec = { ...currentStrutSection } as unknown as Record<string, number>;
+    sec[key] = Math.max(0.0005, sec[key] * factor);   // never below 0.5 mm
+    currentStrutSection = sec as unknown as CrossSection;
+    updateMassReadout();
+  },
+  setPlanet: (p) => { window.location.search = `?planet=${p}`; },
+    setPlanet: (p) => { window.location.search = `?planet=${p}`; },
+  exitVR,
+});
+
+
+// One grabber per hand: works with bare hands (pinch) or controllers (grip)
+type Grabber = {
+  side: "left" | "right";
+  hand: BABYLON.WebXRHand | null;
+  controller: BABYLON.WebXRInputSource | null;
+  held: number | null;        // node this hand is holding
+  usesFdm: boolean;           // true if this hand owns the FDM grab
+  ball: BABYLON.Mesh;
+  mat: BABYLON.StandardMaterial;
+};
+
+const PINCH_ON = 0.02;    // fingertips closer than 2 cm = pinching
+const PINCH_OFF = 0.04;   // must open past 4 cm to release (no flicker)
+
+const makeGrabber = (side: "left" | "right", scene: BABYLON.Scene): Grabber => {
+  const ball = BABYLON.MeshBuilder.CreateSphere(`ball_${side}`, { diameter: 2 * GRAB_RADIUS }, scene);
+  const mat = new BABYLON.StandardMaterial(`ballMat_${side}`, scene);
+  mat.alpha = 0.3;
+  ball.material = mat;
+  ball.isPickable = false;
+  ball.isVisible = false;
+  return { side, hand: null, controller: null, held: null, usesFdm: false, ball, mat };
+};
+
+const updateGrabber = (g: Grabber) => {
+  // 1. grab point + is the hand closing?
+  let pos: BABYLON.Vector3 | null = null;
+  let closing = false;
+  if (g.hand) {
+    const thumb = g.hand.getJointMesh(BABYLON.WebXRHandJoint.THUMB_TIP).getAbsolutePosition();
+    const index = g.hand.getJointMesh(BABYLON.WebXRHandJoint.INDEX_FINGER_TIP).getAbsolutePosition();
+    pos = thumb.add(index).scale(0.5);
+    const gap = BABYLON.Vector3.Distance(thumb, index);
+    closing = gap < (g.held !== null ? PINCH_OFF : PINCH_ON);
+  } else if (g.controller) {
+    pos = handPosition(g.controller);
+    closing = g.controller.inputSource.gamepad?.buttons[1]?.pressed ?? false;
+  }
+
+  g.ball.isVisible = pos !== null;
+  if (!pos) return;
+  g.ball.position.copyFrom(pos);
+
+  let nearest = findNearestNode(pos);
+  if (nearest !== null && xrHeld.has(nearest) && nearest !== g.held) nearest = null;  // other hand has it
+
+  // blue = closing, green = node in reach, red = nothing
+  g.mat.emissiveColor = closing ? BABYLON.Color3.Blue()
+    : nearest !== null ? BABYLON.Color3.Green() : BABYLON.Color3.Red();
+
+  // 2. start grab
+  if (closing && g.held === null && nearest !== null) {
+    if (grabMode === "fdm") {
+      if (!fdm || fdmDragging) return;          // FDM handles one node at a time
+      fdm.nodes = points.map((p) => toVec3(p.position));
+      try { fdm.startGrab(nearest); }
+      catch { fdmStatus = "FDM: that node is an anchor"; updateFdmStatus(); return; }
+      fdmDragging = true;
+      g.usesFdm = true;
+    }
+    g.held = nearest;
+    xrHeld.add(nearest);
+  }
+
+  // 3. release
+  if (!closing && g.held !== null) {
+    if (g.usesFdm && fdm) fdm.endGrab();
+    if (g.usesFdm) fdmDragging = false;
+    g.usesFdm = false;
+    xrHeld.delete(g.held);
+    g.held = null;
+  }
+
+  // 4. follow the hand
+  if (g.held !== null) moveNode(g.held, pos, g.usesFdm);
+};
+
 const setupXR = async (scene: BABYLON.Scene, floor: BABYLON.AbstractMesh) => {
-  try { 
+  try {
     const xr = await scene.createDefaultXRExperienceAsync({
       floorMeshes: [floor],
-      teleportationOptions: {
-    floorMeshes: [floor],
-    forceHandedness: "left",
-  },
+      disableTeleportation: true,   // both hands are for grabbing now
     });
-    xr.input.onControllerAddedObservable.add((controller) => {
-  controller.onMotionControllerInitObservable.add((motionController) => {
-    const squeeze = motionController.getComponent("xr-standard-squeeze");
-    squeeze?.onButtonStateChangedObservable.add((component) => {
-      if (component.changes.pressed) {
-        if (component.pressed) {
-          console.log("squeeze ON", motionController.handedness);
-        } else {
-          console.log("squeeze OFF", motionController.handedness);
-        }
+
+    const grabbers = { left: makeGrabber("left", scene), right: makeGrabber("right", scene) };
+    const sideOf = (s: XRHandedness) => (s === "left" || s === "right" ? grabbers[s] : null);
+
+    // bare hands
+    let handTracking = xr.baseExperience.featuresManager.getEnabledFeature(
+      BABYLON.WebXRFeatureName.HAND_TRACKING) as BABYLON.WebXRHandTracking | null;
+    if (!handTracking) {
+      handTracking = xr.baseExperience.featuresManager.enableFeature(
+        BABYLON.WebXRFeatureName.HAND_TRACKING, "latest", { xrInput: xr.input }) as BABYLON.WebXRHandTracking;
+    }
+    handTracking.onHandAddedObservable.add((h) => {
+      const g = sideOf(h.xrController.inputSource.handedness);
+      if (g) g.hand = h;
+    });
+    handTracking.onHandRemovedObservable.add((h) => {
+      const g = sideOf(h.xrController.inputSource.handedness);
+      if (g && g.hand === h) g.hand = null;
+    });
+
+    // controllers (if you pick them up)
+    const addController = (c: BABYLON.WebXRInputSource) => {
+      if (c.inputSource.hand) return;
+      const g = sideOf(c.inputSource.handedness);
+      if (g) g.controller = c;
+    };
+    xr.input.controllers.forEach(addController);
+    xr.input.onControllerAddedObservable.add(addController);
+    xr.input.onControllerRemovedObservable.add((c) => {
+      const g = sideOf(c.inputSource.handedness);
+      if (g && g.controller === c) g.controller = null;
+    });
+
+    scene.onBeforeRenderObservable.add(() => {
+      updateGrabber(grabbers.left);
+      updateGrabber(grabbers.right);
+    });
+
+           // the menu console: only visible inside VR
+        const panel = createVRPanel(scene, makeVRPanelAPI(scene, () => { void xr.baseExperience.exitXRAsync(); }));
+    panel.setVisible(false);
+
+    const placeConsole = () => {
+      const eye = xr.baseExperience.camera.position.clone();
+      const spot = new BABYLON.Vector3(-0.45, eye.y - 0.15, -0.4);
+      let floorY = 0;
+      try {
+        // terrain height under the console, so the stand touches the ground
+        const down = new BABYLON.Ray(new BABYLON.Vector3(spot.x, eye.y + 50, spot.z), new BABYLON.Vector3(0, -1, 0), 200);
+        const hit = scene.pickWithRay(down, (m) => m === floor);
+        if (hit?.pickedPoint) floorY = hit.pickedPoint.y;
+      } catch (e) {
+        console.warn("console: ground ray failed", e);
       }
+      if (floorY > spot.y - 0.3) floorY = spot.y - 1.2;   // ground above the screen? ignore it
+      panel.placeFacing(spot, eye, floorY);
+      panel.setVisible(true);
+    };
+
+    xr.baseExperience.onInitialXRPoseSetObservable.add((xrCamera) => {
+      xrCamera.position.x = 0;
+      xrCamera.position.z = -0.8;   // 80 cm in front of the structure
+      placeConsole();
     });
-  });
-});
-xr.baseExperience.onInitialXRPoseSetObservable.add((xrCamera) => {
-  xrCamera.position.x = 0;
-  xrCamera.position.z = -0.8;   // 80 cm in front of the structure
-});
-    return xr;
-  }
-  catch (e){
+    xr.baseExperience.onStateChangedObservable.add((state) => {
+      if (state === BABYLON.WebXRState.IN_XR) placeConsole();          // backup, in case the pose event is missed
+      if (state === BABYLON.WebXRState.NOT_IN_XR) panel.setVisible(false);
+    });
+  } catch (e) {
     console.warn("XR not available:", e);
   }
-  };
+};
  
 const addMountainSilhouettes = (scene: BABYLON.Scene, horizon: BABYLON.Color3) => {
   type Massif = { az: number; width: number; height: number };   // az in degrees, same as sunAzimuthDeg
@@ -1096,7 +1314,7 @@ engine.runRenderLoop(() => {
   // NEW (FDM): physics only runs in dynamics mode; FDM mode is static form-finding
   if (grabMode === "dynamics") {
     integrate(FIXED_DT);
-    const passes = selectedPointIndex !== null ? 3 : SUBSTEPS;
+    const passes = selectedPointIndex !== null || xrHeld.size > 0 ? 3 : SUBSTEPS;
     for (let i = 0; i < passes; i++) {
       solveConstraints();
     }
