@@ -2,5 +2,6 @@
   import basicSsl from "@vitejs/plugin-basic-ssl";
 
   export default defineConfig({
+    base: "/tensegrity_simulator/",
     plugins: [basicSsl()],
   });
