@@ -8,7 +8,7 @@ An interactive 3D/VR simulator for tensegrity structures, built with **Babylon.j
 
 | Tool | Version | Check with |
 |------|---------|-----------|
-| [Node.js](https://nodejs.org/) | 20 LTS or newer | `node -v` |
+| [Node.js](https://nodejs.org/) | 22.12 or newer | `node -v` |
 | npm | comes with Node.js | `npm -v` |
 | [Git](https://git-scm.com/) | any recent version | `git --version` |
 
@@ -87,11 +87,30 @@ WebXR only works on a **secure context**: either `localhost` or an `https://` ad
   import basicSsl from "@vitejs/plugin-basic-ssl";
 
   export default defineConfig({
+    base: "/tensegrity_simulator/",
     plugins: [basicSsl()],
   });
   ```
 
   Restart `npm run dev -- --host`, open the `https://` network address on the headset, and accept the browser's certificate warning.
+
+---
+
+## Deploying to GitHub Pages
+
+The demo is published at https://dotcoogs.github.io/tensegrity_simulator/ once GitHub Pages is enabled and the first deployment succeeds.
+
+### One-time repository setup
+
+A repository administrator must open **Settings > Pages**, select **GitHub Actions** under **Build and deployment > Source**, and enable **Enforce HTTPS**. HTTPS is required for WebXR on a VR headset. The workflow publishes to GitHub Pages; the development SSL plugin is only used for local testing.
+
+### Automatic updates
+
+The workflow in `.github/workflows/deploy.yml` runs whenever a commit is pushed to `main`. It uses Node.js 22, installs the locked dependencies with `npm ci`, runs `npm run build`, and deploys `dist/`. A failed build stops publication. Build files do not need to be committed.
+
+After merging demo changes into `main`, check the deployment in the repository's **Actions** tab. To publish the current `main` manually, select **Deploy demo to GitHub Pages > Run workflow**, with `main` selected. Feature branches do not trigger automatic deployment.
+
+The Vite base path and the terrain and sky URLs include `/tensegrity_simulator/`, so assets load correctly from the project site.
 
 ---
 

@@ -1205,7 +1205,7 @@ const setupMarsAtmosphere = (scene: BABYLON.Scene, env: MoonEnvironment) => {
   
 const setupWorld = async (scene: BABYLON.Scene, moon: MoonEnvironment) => {
   try {
-    const file = PLANET === "mars" ? "/mars_terrain.glb" : "/moon_terrain.glb";
+    const file = import.meta.env.BASE_URL + (PLANET === "mars" ? "mars_terrain.glb" : "moon_terrain.glb");
     const result = await BABYLON.ImportMeshAsync(file, scene);
     const terrain = result.meshes.find((m) => m.getTotalVertices() > 0)!;
     // NOTE: no createNormals here - the .glb already has correct normals
@@ -1229,12 +1229,11 @@ const setupWorld = async (scene: BABYLON.Scene, moon: MoonEnvironment) => {
       moon.sun.direction = new BABYLON.Vector3(-0.8, -0.15, 0.58).normalize();
       moon.sun.intensity = 2.7;
       moon.fill.intensity = 0.14;
-      const stars = new BABYLON.PhotoDome("realStars", "/starmap_4k.jpg", { size: 10000 }, scene);
+      const stars = new BABYLON.PhotoDome("realStars", `${import.meta.env.BASE_URL}starmap_4k.jpg`, { size: 10000 }, scene);
       stars.mesh.isPickable = false;
       stars.rotation.x = Math.PI;   // south celestial pole overhead
     } else {
       // Mars: butterscotch sky, dust haze, warm light, softer shadows
-      const sky = new BABYLON.Color3(0.80, 0.62, 0.45);
       groundMat.diffuseColor = new BABYLON.Color3(0.80, 0.50, 0.33);
       moon.sun.direction = new BABYLON.Vector3(-0.5, -0.6, 0.6).normalize();
       moon.sun.intensity = 2.2;
