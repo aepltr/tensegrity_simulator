@@ -23,7 +23,7 @@ A modern browser is also needed (Chrome, Edge, or the Meta Quest Browser for VR)
 > This repository is private. You need to be added as a collaborator to clone it.
 
 ```bash
-git clone https://github.com/aepltr/tensegrity_simulator.git
+git clone https://github.com/dotcoogs/tensegrity_simulator.git
 cd tensegrity_simulator
 ```
 
